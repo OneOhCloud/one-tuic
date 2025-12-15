@@ -1,0 +1,27 @@
+{
+    "relay": {
+        "server": "example.com:443",
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "password": "your_password_here",
+        "udp_relay_mode": "native",
+        "congestion_control": "bbr",
+        "zero_rtt_handshake": false,
+        "disable_sni": false,
+        "timeout": "8s",
+        "heartbeat": "3s",
+        "skip_cert_verify": false,
+        "send_window": 16777216,
+        "receive_window": 8388608,
+        "initial_mtu": 1200,
+        "min_mtu": 1200,
+        "gso": true,
+        "pmtu": true,
+        "gc_interval": "3s",
+        "gc_lifetime": "15s"
+    },
+    "local": {
+        "server": "127.0.0.1:1080",
+        "max_packet_size": 1500
+    },
+    "log_level": "info"
+}
