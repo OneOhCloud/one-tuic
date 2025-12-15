@@ -4,10 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
-	"strings"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OneOhCloud/one-tuic/internal/outbound"
@@ -35,12 +35,12 @@ type Config struct {
 
 // Outbound implements outbound.Outbound for TUIC protocol
 type Outbound struct {
-	cfg    Config
-	conn   *quic.Conn
-	udpMgr *udpSessionManager
-	mu     sync.Mutex
-	ctx    context.Context
-	cancel context.CancelFunc
+	cfg       Config
+	conn      atomic.Pointer[quic.Conn]
+	udpMgr    atomic.Pointer[udpSessionManager]
+	connectMu sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // New creates a new TUIC outbound
@@ -55,18 +55,21 @@ func New(cfg Config) *Outbound {
 
 // Connect establishes connection to TUIC server
 func (o *Outbound) Connect(ctx context.Context) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.connectMu.Lock()
+	defer o.connectMu.Unlock()
 
-	return o.connectLocked(ctx)
+	// Double check after acquiring lock
+	if o.conn.Load() != nil {
+		return nil
+	}
+
+	return o.doConnect(ctx)
 }
 
-func (o *Outbound) connectLocked(ctx context.Context) error {
+func (o *Outbound) doConnect(ctx context.Context) error {
 	// Close existing connection if any
-	if o.conn != nil {
-		o.conn.CloseWithError(0, "reconnecting")
-		o.conn = nil
-		o.udpMgr = nil
+	if oldConn := o.conn.Load(); oldConn != nil {
+		(*oldConn).CloseWithError(0, "reconnecting")
 	}
 
 	conn, err := o.dial(ctx)
@@ -74,21 +77,22 @@ func (o *Outbound) connectLocked(ctx context.Context) error {
 		return err
 	}
 
-	o.conn = conn
+	// Perform authentication before storing connection
+	if err := o.authenticate(conn); err != nil {
+		conn.CloseWithError(0, "auth failed")
+		return fmt.Errorf("authentication failed: %w", err)
+	}
 
 	// Initialize UDP session manager
 	mode := UDPModeNative
 	if o.cfg.UDPRelayMode == "quic" {
 		mode = UDPModeQuic
 	}
-	o.udpMgr = newUDPSessionManager(conn, mode, o.ctx)
+	udpMgr := newUDPSessionManager(conn, mode, o.ctx)
 
-	// Perform authentication synchronously to ensure it completes before returning
-	if err := o.authenticateLocked(); err != nil {
-		o.conn.CloseWithError(0, "auth failed")
-		o.conn = nil
-		return fmt.Errorf("authentication failed: %w", err)
-	}
+	// Store atomically
+	o.conn.Store(conn)
+	o.udpMgr.Store(udpMgr)
 
 	// Start heartbeat
 	go o.runHeartbeat(conn)
@@ -122,6 +126,7 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 		tlsConfig.ServerName = host
 	}
 
+	// 优化 QUIC 配置以支持高并发
 	quicConfig := &quic.Config{
 		MaxIdleTimeout:                 30 * time.Second,
 		KeepAlivePeriod:                o.cfg.Heartbeat,
@@ -131,6 +136,9 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 		MaxConnectionReceiveWindow:     o.cfg.SendWindow,
 		EnableDatagrams:                o.cfg.UDPRelayMode == "native",
 		Allow0RTT:                      o.cfg.ZeroRTT,
+		MaxIncomingStreams:             1 << 60,
+		MaxIncomingUniStreams:          1 << 60,
+		DisablePathMTUDiscovery:        !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "darwin"),
 	}
 
 	timeout := o.cfg.Timeout
@@ -144,14 +152,14 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 	return quic.DialAddr(dialCtx, addr.String(), tlsConfig, quicConfig)
 }
 
-func (o *Outbound) authenticateLocked() error {
-	stream, err := o.conn.OpenUniStream()
+func (o *Outbound) authenticate(conn *quic.Conn) error {
+	stream, err := conn.OpenUniStream()
 	if err != nil {
 		return err
 	}
 	defer stream.Close()
 
-	state := o.conn.ConnectionState()
+	state := conn.ConnectionState()
 	tlsState := state.TLS
 
 	label := string(o.cfg.UUID[:])
@@ -184,118 +192,85 @@ func (o *Outbound) runHeartbeat(conn *quic.Conn) {
 		case <-o.ctx.Done():
 			return
 		case <-ticker.C:
-			o.mu.Lock()
-			if o.conn != conn {
-				o.mu.Unlock()
+			currentConn := o.conn.Load()
+			if currentConn == nil || currentConn != conn {
 				return
 			}
 			if conn.ConnectionState().SupportsDatagrams {
 				heartbeat := protocol.EncodeHeartbeat()
 				_ = conn.SendDatagram(heartbeat)
 			}
-			o.mu.Unlock()
 		}
 	}
 }
 
-func (o *Outbound) isConnectionClosed(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "Application error 0x0") ||
-		strings.Contains(errStr, "connection closed") ||
-		strings.Contains(errStr, "use of closed") ||
-		strings.Contains(errStr, "timeout")
-}
+// offer returns an active connection, creating a new one if necessary
+func (o *Outbound) offer(ctx context.Context) (*quic.Conn, error) {
+	o.connectMu.Lock()
+	defer o.connectMu.Unlock()
 
-func (o *Outbound) getConnWithRetry(ctx context.Context) (*quic.Conn, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if o.conn == nil {
-		if err := o.connectLocked(ctx); err != nil {
-			return nil, err
+	// Check if existing connection is still valid
+	if conn := o.conn.Load(); conn != nil {
+		select {
+		case <-conn.Context().Done():
+			// Connection is closed, need to create new one
+		default:
+			// Connection is active
+			return conn, nil
 		}
 	}
 
-	return o.conn, nil
-}
-
-func (o *Outbound) reconnect(ctx context.Context) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	return o.connectLocked(ctx)
+	// Create new connection
+	if err := o.doConnect(ctx); err != nil {
+		return nil, err
+	}
+	return o.conn.Load(), nil
 }
 
 // DialTCP implements outbound.Outbound
 func (o *Outbound) DialTCP(ctx context.Context, addr outbound.Address) (outbound.TCPConn, error) {
-	conn, err := o.getConnWithRetry(ctx)
+	conn, err := o.offer(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := conn.OpenStreamSync(ctx)
+	// 使用非阻塞 OpenStream 提高并发性能
+	stream, err := conn.OpenStream()
 	if err != nil {
-		// Connection might be closed, try to reconnect
-		if o.isConnectionClosed(err) {
-			if reconnErr := o.reconnect(ctx); reconnErr != nil {
-				return nil, fmt.Errorf("failed to reconnect: %w", reconnErr)
-			}
-
-			conn, err = o.getConnWithRetry(ctx)
-			if err != nil {
-				return nil, err
-			}
-
-			stream, err = conn.OpenStreamSync(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open stream after reconnect: %w", err)
-			}
-		} else {
-			return nil, fmt.Errorf("failed to open stream: %w", err)
-		}
+		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
-	tuicAddr := protocol.Address{
+	destination := protocol.Address{
 		Type: protocol.AddressType(addr.Type),
 		Host: addr.Host,
 		Port: addr.Port,
 	}
 
-	connectCmd := protocol.EncodeConnect(tuicAddr)
-	if _, err := stream.Write(connectCmd); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("failed to send connect command: %w", err)
-	}
-
-	return &tcpConn{stream: stream}, nil
+	// 返回延迟写入连接，Connect 命令会与第一个数据包合并发送
+	return &tcpConn{stream: stream, destination: destination}, nil
 }
 
 // DialUDP implements outbound.Outbound
 func (o *Outbound) DialUDP(ctx context.Context) (outbound.UDPConn, error) {
-	if _, err := o.getConnWithRetry(ctx); err != nil {
+	if _, err := o.offer(ctx); err != nil {
 		return nil, err
 	}
 
-	o.mu.Lock()
-	session := o.udpMgr.newSession()
-	o.mu.Unlock()
+	udpMgr := o.udpMgr.Load()
+	if udpMgr == nil {
+		return nil, fmt.Errorf("UDP manager not initialized")
+	}
 
+	session := udpMgr.newSession()
 	return &udpConn{session: session}, nil
 }
 
 // Close implements outbound.Outbound
 func (o *Outbound) Close() error {
 	o.cancel()
-	o.mu.Lock()
-	defer o.mu.Unlock()
 
-	if o.conn != nil {
-		err := o.conn.CloseWithError(0, "client closing")
-		o.conn = nil
-		return err
+	if conn := o.conn.Load(); conn != nil {
+		return conn.CloseWithError(0, "client closing")
 	}
 	return nil
 }
@@ -305,20 +280,42 @@ func (o *Outbound) Name() string {
 	return "tuic"
 }
 
-// tcpConn wraps a QUIC stream as outbound.TCPConn
+// tcpConn wraps a QUIC stream as outbound.TCPConn with lazy write optimization
 type tcpConn struct {
-	stream *quic.Stream
+	stream         *quic.Stream
+	destination    protocol.Address
+	requestWritten bool
 }
 
 func (c *tcpConn) Read(p []byte) (n int, err error) {
 	return c.stream.Read(p)
 }
 
+// Write 实现延迟写入优化：将 Connect 命令与第一个数据包合并发送，减少 RTT
 func (c *tcpConn) Write(p []byte) (n int, err error) {
+	if !c.requestWritten {
+		// 将 Connect 命令和用户数据合并为一个包发送
+		header := protocol.EncodeConnect(c.destination)
+		combined := make([]byte, len(header)+len(p))
+		copy(combined, header)
+		copy(combined[len(header):], p)
+		_, err = c.stream.Write(combined)
+		if err != nil {
+			return 0, err
+		}
+		c.requestWritten = true
+		return len(p), nil
+	}
 	return c.stream.Write(p)
 }
 
+// CloseWrite 实现半关闭，通知对端写入完成
+func (c *tcpConn) CloseWrite() error {
+	return c.stream.Close()
+}
+
 func (c *tcpConn) Close() error {
+	c.stream.CancelRead(0)
 	return c.stream.Close()
 }
 
@@ -357,28 +354,4 @@ func (c *udpConn) LocalAddr() string {
 
 func (c *udpConn) Close() error {
 	return c.session.close()
-}
-
-// Relay copies data bidirectionally between two connections
-func Relay(dst, src io.ReadWriteCloser) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		io.Copy(dst, src)
-		if closer, ok := dst.(interface{ CloseWrite() error }); ok {
-			closer.CloseWrite()
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		io.Copy(src, dst)
-		if closer, ok := src.(interface{ CloseWrite() error }); ok {
-			closer.CloseWrite()
-		}
-	}()
-
-	wg.Wait()
 }
