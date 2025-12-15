@@ -126,10 +126,15 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 		tlsConfig.ServerName = host
 	}
 
-	// 优化 QUIC 配置以支持高并发
+	// 优化 QUIC 配置以支持高并发和长连接
+	keepAlive := o.cfg.Heartbeat
+	if keepAlive <= 0 {
+		keepAlive = 10 * time.Second
+	}
+
 	quicConfig := &quic.Config{
 		MaxIdleTimeout:                 30 * time.Second,
-		KeepAlivePeriod:                o.cfg.Heartbeat,
+		KeepAlivePeriod:                keepAlive,
 		InitialStreamReceiveWindow:     uint64(o.cfg.ReceiveWindow),
 		MaxStreamReceiveWindow:         uint64(o.cfg.ReceiveWindow),
 		InitialConnectionReceiveWindow: o.cfg.SendWindow,
@@ -196,9 +201,22 @@ func (o *Outbound) runHeartbeat(conn *quic.Conn) {
 			if currentConn == nil || currentConn != conn {
 				return
 			}
+
+			// 优化心跳：同时支持数据报和流方式保活
 			if conn.ConnectionState().SupportsDatagrams {
 				heartbeat := protocol.EncodeHeartbeat()
 				_ = conn.SendDatagram(heartbeat)
+			} else {
+				// 当不支持数据报时，使用单向流发送心跳
+				// 这确保长连接在任何情况下都能保活
+				go func() {
+					stream, err := conn.OpenUniStream()
+					if err == nil {
+						heartbeat := protocol.EncodeHeartbeat()
+						stream.Write(heartbeat)
+						stream.Close()
+					}
+				}()
 			}
 		}
 	}
@@ -247,7 +265,11 @@ func (o *Outbound) DialTCP(ctx context.Context, addr outbound.Address) (outbound
 	}
 
 	// 返回延迟写入连接，Connect 命令会与第一个数据包合并发送
-	return &tcpConn{stream: stream, destination: destination}, nil
+	return &tcpConn{
+		stream:       stream,
+		destination:  destination,
+		lastActivity: time.Now(),
+	}, nil
 }
 
 // DialUDP implements outbound.Outbound
@@ -285,10 +307,22 @@ type tcpConn struct {
 	stream         *quic.Stream
 	destination    protocol.Address
 	requestWritten bool
+	lastActivity   time.Time
+	activityMu     sync.Mutex
+}
+
+func (c *tcpConn) updateActivity() {
+	c.activityMu.Lock()
+	c.lastActivity = time.Now()
+	c.activityMu.Unlock()
 }
 
 func (c *tcpConn) Read(p []byte) (n int, err error) {
-	return c.stream.Read(p)
+	n, err = c.stream.Read(p)
+	if n > 0 {
+		c.updateActivity()
+	}
+	return
 }
 
 // Write 实现延迟写入优化：将 Connect 命令与第一个数据包合并发送，减少 RTT
@@ -304,9 +338,15 @@ func (c *tcpConn) Write(p []byte) (n int, err error) {
 			return 0, err
 		}
 		c.requestWritten = true
+		c.updateActivity()
 		return len(p), nil
 	}
-	return c.stream.Write(p)
+
+	n, err = c.stream.Write(p)
+	if n > 0 {
+		c.updateActivity()
+	}
+	return
 }
 
 // CloseWrite 实现半关闭，通知对端写入完成
