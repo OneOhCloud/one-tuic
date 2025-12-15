@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/OneOhCloud/one-tuic/internal/outbound"
@@ -35,13 +35,12 @@ type Config struct {
 
 // Outbound implements outbound.Outbound for TUIC protocol
 type Outbound struct {
-	cfg         Config
-	conn        *quic.Conn
-	udpMgr      *udpSessionManager
-	isConnected atomic.Bool
-	mu          sync.RWMutex
-	ctx         context.Context
-	cancel      context.CancelFunc
+	cfg    Config
+	conn   *quic.Conn
+	udpMgr *udpSessionManager
+	mu     sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New creates a new TUIC outbound
@@ -59,8 +58,15 @@ func (o *Outbound) Connect(ctx context.Context) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	if o.isConnected.Load() {
-		return nil
+	return o.connectLocked(ctx)
+}
+
+func (o *Outbound) connectLocked(ctx context.Context) error {
+	// Close existing connection if any
+	if o.conn != nil {
+		o.conn.CloseWithError(0, "reconnecting")
+		o.conn = nil
+		o.udpMgr = nil
 	}
 
 	conn, err := o.dial(ctx)
@@ -69,7 +75,6 @@ func (o *Outbound) Connect(ctx context.Context) error {
 	}
 
 	o.conn = conn
-	o.isConnected.Store(true)
 
 	// Initialize UDP session manager
 	mode := UDPModeNative
@@ -78,17 +83,20 @@ func (o *Outbound) Connect(ctx context.Context) error {
 	}
 	o.udpMgr = newUDPSessionManager(conn, mode, o.ctx)
 
-	// Start authentication
-	go o.authenticate()
+	// Perform authentication synchronously to ensure it completes before returning
+	if err := o.authenticateLocked(); err != nil {
+		o.conn.CloseWithError(0, "auth failed")
+		o.conn = nil
+		return fmt.Errorf("authentication failed: %w", err)
+	}
 
 	// Start heartbeat
-	go o.runHeartbeat()
+	go o.runHeartbeat(conn)
 
 	return nil
 }
 
 func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
-	// Resolve server address
 	host, port, err := net.SplitHostPort(o.cfg.Server)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server address: %w", err)
@@ -99,7 +107,6 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 		return nil, fmt.Errorf("failed to resolve server address: %w", err)
 	}
 
-	// Configure TLS
 	tlsConfig := &tls.Config{
 		NextProtos:         o.cfg.ALPN,
 		InsecureSkipVerify: o.cfg.SkipCertVerify,
@@ -115,7 +122,6 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 		tlsConfig.ServerName = host
 	}
 
-	// Configure QUIC
 	quicConfig := &quic.Config{
 		MaxIdleTimeout:                 30 * time.Second,
 		KeepAlivePeriod:                o.cfg.Heartbeat,
@@ -127,29 +133,31 @@ func (o *Outbound) dial(ctx context.Context) (*quic.Conn, error) {
 		Allow0RTT:                      o.cfg.ZeroRTT,
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, o.cfg.Timeout)
+	timeout := o.cfg.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
 	defer dialCancel()
 
 	return quic.DialAddr(dialCtx, addr.String(), tlsConfig, quicConfig)
 }
 
-func (o *Outbound) authenticate() {
+func (o *Outbound) authenticateLocked() error {
 	stream, err := o.conn.OpenUniStream()
 	if err != nil {
-		o.Close()
-		return
+		return err
 	}
+	defer stream.Close()
 
-	// Derive token using TLS keying material exporter
 	state := o.conn.ConnectionState()
 	tlsState := state.TLS
 
 	label := string(o.cfg.UUID[:])
 	token, err := tlsState.ExportKeyingMaterial(label, []byte(o.cfg.Password), 32)
 	if err != nil {
-		stream.Close()
-		o.Close()
-		return
+		return err
 	}
 
 	var tokenArr [32]byte
@@ -157,15 +165,13 @@ func (o *Outbound) authenticate() {
 
 	authCmd := protocol.EncodeAuthenticate(o.cfg.UUID, tokenArr)
 	if _, err := stream.Write(authCmd); err != nil {
-		stream.Close()
-		o.Close()
-		return
+		return err
 	}
 
-	stream.Close()
+	return nil
 }
 
-func (o *Outbound) runHeartbeat() {
+func (o *Outbound) runHeartbeat(conn *quic.Conn) {
 	if o.cfg.Heartbeat <= 0 {
 		return
 	}
@@ -178,43 +184,86 @@ func (o *Outbound) runHeartbeat() {
 		case <-o.ctx.Done():
 			return
 		case <-ticker.C:
-			if o.conn.ConnectionState().SupportsDatagrams {
-				heartbeat := protocol.EncodeHeartbeat()
-				_ = o.conn.SendDatagram(heartbeat)
+			o.mu.Lock()
+			if o.conn != conn {
+				o.mu.Unlock()
+				return
 			}
+			if conn.ConnectionState().SupportsDatagrams {
+				heartbeat := protocol.EncodeHeartbeat()
+				_ = conn.SendDatagram(heartbeat)
+			}
+			o.mu.Unlock()
 		}
 	}
 }
 
-func (o *Outbound) getConn(ctx context.Context) (*quic.Conn, error) {
-	if !o.isConnected.Load() {
-		if err := o.Connect(ctx); err != nil {
+func (o *Outbound) isConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "Application error 0x0") ||
+		strings.Contains(errStr, "connection closed") ||
+		strings.Contains(errStr, "use of closed") ||
+		strings.Contains(errStr, "timeout")
+}
+
+func (o *Outbound) getConnWithRetry(ctx context.Context) (*quic.Conn, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.conn == nil {
+		if err := o.connectLocked(ctx); err != nil {
 			return nil, err
 		}
 	}
+
 	return o.conn, nil
+}
+
+func (o *Outbound) reconnect(ctx context.Context) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return o.connectLocked(ctx)
 }
 
 // DialTCP implements outbound.Outbound
 func (o *Outbound) DialTCP(ctx context.Context, addr outbound.Address) (outbound.TCPConn, error) {
-	conn, err := o.getConn(ctx)
+	conn, err := o.getConnWithRetry(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open stream: %w", err)
+		// Connection might be closed, try to reconnect
+		if o.isConnectionClosed(err) {
+			if reconnErr := o.reconnect(ctx); reconnErr != nil {
+				return nil, fmt.Errorf("failed to reconnect: %w", reconnErr)
+			}
+
+			conn, err = o.getConnWithRetry(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			stream, err = conn.OpenStreamSync(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to open stream after reconnect: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to open stream: %w", err)
+		}
 	}
 
-	// Convert address
 	tuicAddr := protocol.Address{
 		Type: protocol.AddressType(addr.Type),
 		Host: addr.Host,
 		Port: addr.Port,
 	}
 
-	// Send Connect command
 	connectCmd := protocol.EncodeConnect(tuicAddr)
 	if _, err := stream.Write(connectCmd); err != nil {
 		stream.Close()
@@ -226,20 +275,27 @@ func (o *Outbound) DialTCP(ctx context.Context, addr outbound.Address) (outbound
 
 // DialUDP implements outbound.Outbound
 func (o *Outbound) DialUDP(ctx context.Context) (outbound.UDPConn, error) {
-	if _, err := o.getConn(ctx); err != nil {
+	if _, err := o.getConnWithRetry(ctx); err != nil {
 		return nil, err
 	}
 
+	o.mu.Lock()
 	session := o.udpMgr.newSession()
+	o.mu.Unlock()
+
 	return &udpConn{session: session}, nil
 }
 
 // Close implements outbound.Outbound
 func (o *Outbound) Close() error {
-	o.isConnected.Store(false)
 	o.cancel()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	if o.conn != nil {
-		return o.conn.CloseWithError(0, "client closing")
+		err := o.conn.CloseWithError(0, "client closing")
+		o.conn = nil
+		return err
 	}
 	return nil
 }
